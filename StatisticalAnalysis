@@ -1,0 +1,178 @@
+from statsmodels.compat.python import (iteritems, range, lrange, string_types,
+                                       lzip, zip, long)
+from statsmodels.compat.scipy import _next_regular
+
+import numpy as np
+import pandas as pd
+from numpy.linalg import LinAlgError
+from scipy import stats
+
+from statsmodels.regression.linear_model import OLS, yule_walker
+from statsmodels.tools.sm_exceptions import (InterpolationWarning,
+                                             MissingDataError)
+from statsmodels.tools.tools import add_constant, Bunch
+from statsmodels.tsa._bds import bds
+from statsmodels.tsa.adfvalues import mackinnonp, mackinnoncrit
+from statsmodels.tsa.arima_model import ARMA
+from statsmodels.tsa.tsatools import lagmat, lagmat2ds, add_trend
+
+# https://www.statsmodels.org/stable/_modules/statsmodels/tsa/stattools.html
+
+SQRTEPS = np.sqrt(np.finfo(np.double).eps)
+
+def coint(y0, y1, trend='c', method='aeg', maxlag=None, autolag='aic',
+          return_results=None):
+    
+    trend = trend.lower()
+    if trend not in ['c', 'nc', 'ct', 'ctt']:
+        raise ValueError("trend option %s not understood" % trend)
+    y0 = np.asarray(y0)
+    y1 = np.asarray(y1)
+    if y1.ndim < 2:
+        y1 = y1[:, None]
+    nobs, k_vars = y1.shape
+    k_vars += 1   # add 1 for y0
+
+    if trend == 'nc':
+        xx = y1
+    else:
+        xx = add_trend(y1, trend=trend, prepend=False)
+
+    res_co = OLS(y0, xx).fit()
+    OLS_params = res_co.params
+
+    if res_co.rsquared < 1 - 100 * SQRTEPS:
+        res_adf = adfuller(res_co.resid, maxlag=maxlag, autolag=autolag,
+                           regression='nc')
+    else:
+        # Edge case where series are too similar
+        res_adf = (-np.inf,)
+
+    pval_asy = mackinnonp(res_adf[0], regression=trend, N=k_vars)
+    return res_adf[0], pval_asy, OLS_params
+    
+def adfuller(x, maxlag=None, regression="c", autolag='AIC',
+             store=False, regresults=False):
+
+    if regresults:
+        store = True
+
+    trenddict = {None: 'nc', 0: 'c', 1: 'ct', 2: 'ctt'}
+    if regression is None or isinstance(regression, (int, long)):
+        regression = trenddict[regression]
+    regression = regression.lower()
+    if regression not in ['c', 'nc', 'ct', 'ctt']:
+        raise ValueError("regression option %s not understood") % regression
+    x = np.asarray(x)
+    nobs = x.shape[0]
+
+    ntrend = len(regression) if regression != 'nc' else 0
+    if maxlag is None:
+        # from Greene referencing Schwert 1989
+        maxlag = int(np.ceil(12. * np.power(nobs / 100., 1 / 4.)))
+        # -1 for the diff
+        maxlag = min(nobs // 2 - ntrend - 1, maxlag)
+        if maxlag < 0:
+            raise ValueError('sample size is too short to use selected '
+                             'regression component')
+    elif maxlag > nobs // 2 - ntrend - 1:
+        raise ValueError('maxlag must be less than (nobs/2 - 1 - ntrend) '
+                         'where n trend is the number of included '
+                         'deterministic regressors')
+    xdiff = np.diff(x)
+    xdall = lagmat(xdiff[:, None], maxlag, trim='both', original='in')
+    nobs = xdall.shape[0]
+
+    xdall[:, 0] = x[-nobs - 1:-1]  # replace 0 xdiff with level of x
+    xdshort = xdiff[-nobs:]
+
+    if store:
+        resstore = ResultsStore()
+    if autolag:
+        if regression != 'nc':
+            fullRHS = add_trend(xdall, regression, prepend=True)
+        else:
+            fullRHS = xdall
+        startlag = fullRHS.shape[1] - xdall.shape[1] + 1 # 1 for level
+
+        if not regresults:
+            icbest, bestlag = _autolag(OLS, xdshort, fullRHS, startlag,
+                                       maxlag, autolag)
+        else:
+            icbest, bestlag, alres = _autolag(OLS, xdshort, fullRHS, startlag,
+                                              maxlag, autolag,
+                                              regresults=regresults)
+            resstore.autolag_results = alres
+
+        bestlag -= startlag  # convert to lag not column index
+
+        # rerun ols with best autolag
+        xdall = lagmat(xdiff[:, None], bestlag, trim='both', original='in')
+        nobs = xdall.shape[0]
+        xdall[:, 0] = x[-nobs - 1:-1]  # replace 0 xdiff with level of x
+        xdshort = xdiff[-nobs:]
+        usedlag = bestlag
+    else:
+        usedlag = maxlag
+        icbest = None
+    if regression != 'nc':
+        resols = OLS(xdshort, add_trend(xdall[:, :usedlag + 1],
+                     regression)).fit()
+    else:
+        resols = OLS(xdshort, xdall[:, :usedlag + 1]).fit()
+
+    adfstat = resols.tvalues[0]
+
+    # Get approx p-value and critical values
+    pvalue = mackinnonp(adfstat, regression=regression, N=1)
+    critvalues = mackinnoncrit(N=1, regression=regression, nobs=nobs)
+    critvalues = {"1%" : critvalues[0], "5%" : critvalues[1],
+                  "10%" : critvalues[2]}
+    if store:
+        resstore.resols = resols
+        resstore.maxlag = maxlag
+        resstore.usedlag = usedlag
+        resstore.adfstat = adfstat
+        resstore.critvalues = critvalues
+        resstore.nobs = nobs
+        resstore.H0 = ("The coefficient on the lagged level equals 1 - "
+                       "unit root")
+        resstore.HA = "The coefficient on the lagged level < 1 - stationary"
+        resstore.icbest = icbest
+        resstore._str = 'Augmented Dickey-Fuller Test Results'
+        return adfstat, pvalue, critvalues, resstore
+    else:
+        if not autolag:
+            return adfstat, pvalue, usedlag, nobs, critvalues
+        else:
+            return adfstat, pvalue, usedlag, nobs, critvalues, icbest
+            
+def _autolag(mod, endog, exog, startlag, maxlag, method, modargs=(),
+             fitargs=(), regresults=False):
+
+    results = {}
+    method = method.lower()
+    for lag in range(startlag, startlag + maxlag + 1):
+        mod_instance = mod(endog, exog[:, :lag], *modargs)
+        results[lag] = mod_instance.fit()
+
+    if method == "aic":
+        icbest, bestlag = min((v.aic, k) for k, v in iteritems(results))
+    elif method == "bic":
+        icbest, bestlag = min((v.bic, k) for k, v in iteritems(results))
+    elif method == "t-stat":
+        #stop = stats.norm.ppf(.95)
+        stop = 1.6448536269514722
+        for lag in range(startlag + maxlag, startlag - 1, -1):
+            icbest = np.abs(results[lag].tvalues[-1])
+            if np.abs(icbest) >= stop:
+                bestlag = lag
+                icbest = icbest
+                break
+    else:
+        raise ValueError("Information Criterion %s not understood.") % method
+
+    if not regresults:
+        return icbest, bestlag
+    else:
+        return icbest, bestlag, results
